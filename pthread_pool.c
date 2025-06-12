@@ -17,7 +17,26 @@ static void *worker(void *param)
 {
     // 여기를 완성하세요
     pthread_pool_t *pool = (pthread_pool_t *)param;
+    task_t task;
+    while (true) {
+        pthread_mutex_lock(&pool->mutex); // 대기열 접근을 위한 락 획득
+        while (pool->q_len == 0 && pool->state == ON) {
+            pthread_cond_wait(&pool->full, &pool->mutex); // 대기열이 비어있으면 대기
+        }
+        if (pool->state == OFF) {
+            pthread_mutex_unlock(&pool->mutex);
+            break; // 스레드풀이 종료 상태면 루프 탈출
+        }
+        task = pool->q[pool->q_front]; // 대기열에서 작업 꺼내기
+        pool->q_front = (pool->q_front + 1) % pool->q_size; // 원형 버퍼 처리
+        pool->q_len--; // 대기열 길이 감소
+        pthread_cond_signal(&pool->empty); // 대기열에 빈 자리가 생겼음을 알림
+        pthread_mutex_unlock(&pool->mutex); // 락 해제
 
+        // 작업 실행
+        task.function(task.param);
+    }
+    pthread_exit(NULL); // 스레드 종료
 }
 
 /*
@@ -56,15 +75,21 @@ int pthread_pool_init(pthread_pool_t *pool, size_t bee_size, size_t queue_size)
     pthread_mutex_init(&pool->mutex, NULL);
     pthread_cond_init(&pool->full, NULL);
     pthread_cond_init(&pool->empty, NULL);
-    pool->state = ON;
     for (size_t i = 0; i < bee_size; ++i) {
-        if (pthread_create(&pool->bee[i], NULL, worker, pool) != 0) {
+        if (pthread_create(&pool->bee[i], NULL, worker, (void *)pool) != 0) {
             pool->state = OFF;
+            for (size_t j = 0; j < i; ++j) {
+                pthread_join(pool->bee[j], NULL); // 이전에 생성된 스레드 조인
+            }
+            pthread_mutex_destroy(&pool->mutex);
+            pthread_cond_destroy(&pool->full);
+            pthread_cond_destroy(&pool->empty);
             free(pool->q);
             free(pool->bee);
             return POOL_FAIL; // 스레드 생성 실패
         }
     }
+    pool->state = ON;
     return POOL_SUCCESS; // 스레드풀 초기화 성공
 
 }
@@ -78,6 +103,24 @@ int pthread_pool_init(pthread_pool_t *pool, size_t bee_size, size_t queue_size)
 int pthread_pool_submit(pthread_pool_t *pool, void (*f)(void *p), void *p, int flag)
 {
     // 여기를 완성하세요
+    if (pool->state != ON) {
+        return POOL_FAIL; // 스레드풀이 실행 중이 아니면 실패
+    }
+    pthread_mutex_lock(&pool->mutex); // 대기열 접근을 위한 락 획득
+    while (pool->q_len == pool->q_size) {
+        if (flag == POOL_NOWAIT) {
+            pthread_mutex_unlock(&pool->mutex);
+            return POOL_FULL; // 대기열이 꽉 찼고, NOWAIT 플래그면 실패
+        }
+        pthread_cond_wait(&pool->empty, &pool->mutex); // 빈 자리가 생길 때까지 대기
+    }
+    // 작업을 대기열에 추가
+    pool->q[(pool->q_front + pool->q_len) % pool->q_size].function = f;
+    pool->q[(pool->q_front + pool->q_len) % pool->q_size].param = p;
+    pool->q_len++; // 대기열 길이 증가
+    pthread_cond_signal(&pool->full); // 대기열에 새 작업이 들어왔음을 알림
+    pthread_mutex_unlock(&pool->mutex); // 락 해제
+    return POOL_SUCCESS; // 작업 요청 성공  
 }
 
 /*
@@ -92,4 +135,38 @@ int pthread_pool_submit(pthread_pool_t *pool, void (*f)(void *p), void *p, int f
 int pthread_pool_shutdown(pthread_pool_t *pool, int how)
 {
     // 여기를 완성하세요
+    pthread_mutex_lock(&pool->mutex); // 대기열 접근을 위한 락 획득
+    if (pool->state == OFF) {
+        pthread_mutex_unlock(&pool->mutex);
+        return POOL_FAIL; // 이미 종료된 스레드풀은 다시 종료할 수 없음
+    }
+    if (how != POOL_COMPLETE && how != POOL_DISCARD) {
+        pthread_mutex_unlock(&pool->mutex);
+        return POOL_FAIL; // 잘못된 종료 옵션
+    }
+    if (pool->state == STANDBY) {
+        pool->state = ON; // 스레드풀이 대기 상태면 실행 상태로 변경
+    }
+    if (how == POOL_COMPLETE) {
+        while (pool->q_len > 0) {
+            pthread_cond_wait(&pool->empty, &pool->mutex); // 대기열이 비워질 때까지 대기
+        }
+    } else if (how == POOL_DISCARD) {
+        pool->q_len = 0; // 대기열의 모든 작업을 버림
+        pool->q_front = 0; // 대기열 포인터 초기화
+    }
+    pool->state = OFF; // 스레드풀 종료 상태로 변경
+    pthread_cond_broadcast(&pool->full); // 모든 일꾼 스레드에게 종료 알림
+    pthread_mutex_unlock(&pool->mutex); // 락 해제
+    for (int i = 0; i < pool->bee_size; ++i) {
+        pthread_join(pool->bee[i], NULL); // 모든 일꾼 스레드와 조인
+    }
+    pthread_mutex_destroy(&pool->mutex); // 락 제거
+    pthread_cond_destroy(&pool->full); // 조건 변수 제거
+    pthread_cond_destroy(&pool->empty); // 조건 변수 제거
+    free(pool->q); // 대기열 메모리 해제
+    free(pool->bee); // 일꾼 스레드 메모리 해제
+    pool->q = NULL; // 포인터 초기화
+    pool->bee = NULL; // 포인터 초기화
+    return POOL_SUCCESS; // 스레드풀 종료 성공
 }
