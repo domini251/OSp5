@@ -17,10 +17,10 @@ static void *worker(void *param)
 {
     // 여기를 완성하세요
     pthread_pool_t *pool = (pthread_pool_t *)param;
-    // task_t task;
+    task_t task;
     while (true) {
         pthread_mutex_lock(&pool->mutex); // 대기열 접근을 위한 락 획득
-        if (pool->q_len == 0 && pool->state == OFF) {
+        if (pool->q_len == 0 && pool->state != ON) {
             pthread_mutex_unlock(&pool->mutex);
             break; // 스레드풀이 종료 상태면 루프 탈출
         }
@@ -31,13 +31,16 @@ static void *worker(void *param)
             pthread_mutex_unlock(&pool->mutex);
             continue; // 대기열이 비어있으면 다시 루프 시작
         }
-        task_t task = pool->q[pool->q_front]; // 대기열에서 작업 꺼내기
+        task = pool->q[pool->q_front]; // 대기열에서 작업 꺼내기
         pool->q_front = (pool->q_front + 1) % pool->q_size; // 원형 버퍼 처리
         pool->q_len--; // 대기열 길이 감소
         pthread_cond_signal(&pool->empty); // 대기열에 빈 자리가 생겼음을 알림
         pthread_mutex_unlock(&pool->mutex); // 락 해제
         // 작업 실행
-        task.function(task.param);
+        if(task.function != NULL) {
+            
+            task.function(task.param); // 작업 함수가 NULL이 아니면 작업 실행
+        }
     }
     pthread_exit(NULL); // 스레드 종료
 }
@@ -54,7 +57,6 @@ static void *worker(void *param)
  */
 int pthread_pool_init(pthread_pool_t *pool, size_t bee_size, size_t queue_size)
 {
-    // 여기를 완성하세요
     if (bee_size > POOL_MAXBSIZE || queue_size > POOL_MAXQSIZE) {
         return POOL_FAIL; // 일꾼 스레드 수 또는 대기열 크기가 최대치를 초과
     }
@@ -119,22 +121,27 @@ int pthread_pool_init(pthread_pool_t *pool, size_t bee_size, size_t queue_size)
  */
 int pthread_pool_submit(pthread_pool_t *pool, void (*f)(void *p), void *p, int flag)
 {
-    // 여기를 완성하세요
-    
     if (pool->state != ON) {
         return POOL_FAIL; // 스레드풀이 실행 중이 아니면 실패
     }
     pthread_mutex_lock(&pool->mutex); // 대기열 접근을 위한 락 획득
-    if (flag == POOL_NOWAIT && pool->q_len == pool->q_size) {
-        pthread_mutex_unlock(&pool->mutex);
-        return POOL_FULL; // 대기열이 꽉 찼고, NOWAIT 플래그면 실패
-    }
-    while (pool->q_len == pool->q_size) {
-        pthread_cond_wait(&pool->empty, &pool->mutex); // 빈 자리가 생길 때까지 대기
+    if (pool->q_len == pool->q_size) {
+        if (flag != POOL_WAIT) {
+            pthread_mutex_unlock(&pool->mutex);
+            return POOL_FULL; // 대기열이 꽉 찼고, NOWAIT 플래그면 실패
+        }
+        while (pool->q_len == pool->q_size) {
+            pthread_cond_wait(&pool->empty, &pool->mutex); // 빈 자리가 생길 때까지 대기
+        }
+        if(pool->state != ON) {
+            pthread_mutex_unlock(&pool->mutex);
+            return POOL_FAIL; // 대기중에 스레드풀이 종료되면 실패
+        }
     }
     // 작업을 대기열에 추가
-    pool->q[(pool->q_front + pool->q_len) % pool->q_size].function = f;
-    pool->q[(pool->q_front + pool->q_len) % pool->q_size].param = p;
+    int q_rear = (pool->q_front + pool->q_len) % pool->q_size;
+    pool->q[q_rear].function = f;
+    pool->q[q_rear].param = p;
     pool->q_len++; // 대기열 길이 증가
     pthread_cond_signal(&pool->full); // 대기열에 새 작업이 들어왔음을 알림
     pthread_mutex_unlock(&pool->mutex); // 락 해제
@@ -152,33 +159,33 @@ int pthread_pool_submit(pthread_pool_t *pool, void (*f)(void *p), void *p, int f
  */
 int pthread_pool_shutdown(pthread_pool_t *pool, int how)
 {
-    // 여기를 완성하세요
     pthread_mutex_lock(&pool->mutex); // 대기열 접근을 위한 락 획득
-    // if (pool->state == OFF) {
-    //     pthread_mutex_unlock(&pool->mutex);
-    //     return POOL_FAIL; // 이미 종료된 스레드풀은 다시 종료할 수 없음
-    // }
-    if (how != POOL_COMPLETE && how != POOL_DISCARD) {
+    if (pool->state == OFF) {
         pthread_mutex_unlock(&pool->mutex);
-        return POOL_FAIL; // 잘못된 종료 옵션
+        return POOL_FAIL; // 이미 종료된 스레드풀은 다시 종료할 수 없음
     }
+
     if (how == POOL_COMPLETE) {
         pool->state = STANDBY; // 스레드풀을 대기 상태로 변경
-        while (pool->q_len > 0) {
-            pthread_cond_wait(&pool->empty, &pool->mutex); // 대기열이 비워질 때까지 대기
-        }
-        pool->state = OFF; // 스레드풀 종료 상태로 변경
-    } else if (how == POOL_DISCARD) {
+    }
+    else if (how == POOL_DISCARD) {
         pool->q_len = 0; // 대기열의 모든 작업을 버림
         pool->q_front = 0; // 대기열 포인터 초기화
         pool->state = OFF; // 스레드풀 종료 상태로 변경
-        pthread_cond_broadcast(&pool->empty); // 대기열이 비워졌음을 알림
+    }
+    else {
+        pthread_mutex_unlock(&pool->mutex);
+        return POOL_FAIL; // 잘못된 종료 옵션
     }
     pthread_cond_broadcast(&pool->full); // 모든 일꾼 스레드에게 종료 알림
+    pthread_cond_broadcast(&pool->empty); // 대기 중인 일꾼 스레드에게 알림
     pthread_mutex_unlock(&pool->mutex); // 락 해제
-    for (int i = 0; i < pool->bee_size; ++i) {
+    for (int i = 0; i < pool->bee_size; i++) {
         pthread_join(pool->bee[i], NULL); // 모든 일꾼 스레드와 조인
     }
+    pthread_mutex_lock(&pool->mutex); // 다시 락 획득
+    pool->state = OFF; // 스레드풀 상태를 종료로 변경
+    pthread_mutex_unlock(&pool->mutex); // 락 해제
     pthread_mutex_destroy(&pool->mutex); // 락 제거
     pthread_cond_destroy(&pool->full); // 조건 변수 제거
     pthread_cond_destroy(&pool->empty); // 조건 변수 제거
