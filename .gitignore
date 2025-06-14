@@ -1,4 +1,4 @@
-./.vscode
-./.idea
-./*.o
-./client
+/.vscode
+/.idea
+/*.o
+/client
